@@ -20,7 +20,9 @@ from charter_parser.models import Clause, ExtractionResult
 
 logger = logging.getLogger(__name__)
 
-MAX_CHARS_PER_CHUNK = 200_000  # ~50K tokens per chunk (safe margin)
+# Chunk size tuned to avoid output truncation. Smaller chunks = more complete responses.
+# 40K chars input → ~10K tokens input → LLM can generate full structured output
+MAX_CHARS_PER_CHUNK = 40_000  
 MAX_RETRIES = 3
 RETRY_DELAY = 5  # seconds between retries
 
@@ -243,11 +245,22 @@ def _call_gemini(
                     f"Response blocked by safety filters: {candidate.safety_ratings}"
                 )
 
+            # Check for truncation due to max tokens
+            finish_reason = None
+            if candidate.finish_reason and hasattr(candidate.finish_reason, "name"):
+                finish_reason = candidate.finish_reason.name
+            if finish_reason in ("MAX_TOKENS", "LENGTH"):
+                logger.warning(
+                    "LLM response truncated (finish_reason=%s). "
+                    "Output may be incomplete - will attempt JSON repair.",
+                    finish_reason,
+                )
+
             raw = response.text
             if not raw:
                 raise ValueError("LLM returned an empty response")
 
-            logger.info("Received %d chars from LLM (attempt %d)", len(raw), attempt)
+            logger.info("Received %d chars from LLM (attempt %d, finish=%s)", len(raw), attempt, finish_reason)
             if hasattr(response, "usage_metadata") and response.usage_metadata:
                 logger.debug("Token usage: %s", response.usage_metadata)
 
@@ -260,6 +273,73 @@ def _call_gemini(
             time.sleep(RETRY_DELAY * attempt)
 
     raise RuntimeError("All retries exhausted")  # should not reach here
+
+
+def _repair_truncated_json(raw: str) -> str:
+    """Attempt to repair truncated JSON by closing open structures."""
+    # Find the last complete clause object (ends with })
+    # Pattern: look for the last complete clause before truncation
+    
+    # Count open brackets
+    open_braces = raw.count("{") - raw.count("}")
+    open_brackets = raw.count("[") - raw.count("]")
+    
+    if open_braces == 0 and open_brackets == 0:
+        return raw  # Already balanced
+    
+    # Try to find the last complete clause
+    # Look for pattern: }, { or }, ] which indicates clause boundary
+    last_complete = -1
+    i = len(raw) - 1
+    brace_depth = 0
+    
+    while i >= 0:
+        if raw[i] == "}":
+            brace_depth += 1
+        elif raw[i] == "{":
+            brace_depth -= 1
+            if brace_depth == 0:
+                # Found a complete object - check if it's followed by comma or bracket
+                j = i - 1
+                while j >= 0 and raw[j] in " \n\t,":
+                    j -= 1
+                if j >= 0 and raw[j] in "[{,":
+                    # This is the start of a complete clause, keep up to the } after this
+                    # Find the matching }
+                    depth = 1
+                    k = i + 1
+                    while k < len(raw) and depth > 0:
+                        if raw[k] == "{":
+                            depth += 1
+                        elif raw[k] == "}":
+                            depth -= 1
+                        k += 1
+                    if depth == 0:
+                        last_complete = k
+                        break
+        i -= 1
+    
+    if last_complete > 0:
+        # Truncate to last complete clause and close the JSON
+        repaired = raw[:last_complete]
+        # Close any remaining structures
+        if "[" in repaired and repaired.count("[") > repaired.count("]"):
+            repaired += "]"
+        if "{" in repaired and repaired.count("{") > repaired.count("}"):
+            repaired += "}"
+        return repaired
+    
+    # Fallback: just close whatever is open
+    repaired = raw.rstrip()
+    # Remove trailing incomplete string/value
+    if repaired.endswith(","):
+        repaired = repaired[:-1]
+    for _ in range(open_braces):
+        repaired += "}"
+    for _ in range(open_brackets):
+        repaired += "]"
+    
+    return repaired
 
 
 def _parse_clauses(raw_content: str) -> list[Clause]:
@@ -291,6 +371,18 @@ def _parse_clauses(raw_content: str) -> list[Clause]:
                 clauses = [Clause.model_validate(c) for c in data["clauses"]]
         except (ValueError, json.JSONDecodeError):
             pass
+
+    if not clauses:
+        # Try to repair truncated JSON
+        logger.warning("JSON parsing failed, attempting to repair truncated response...")
+        try:
+            repaired = _repair_truncated_json(raw_content)
+            data = json.loads(repaired)
+            if "clauses" in data:
+                clauses = [Clause.model_validate(c) for c in data["clauses"]]
+                logger.info("Successfully recovered %d clauses from truncated response", len(clauses))
+        except Exception as e:
+            logger.warning("JSON repair failed: %s", e)
 
     if not clauses:
         raise ValueError(f"Could not parse LLM response as clause JSON: {raw_content[:200]}...")
