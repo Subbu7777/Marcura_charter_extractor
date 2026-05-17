@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 import logging
+import re
+from collections import Counter
 from dataclasses import dataclass
 import fitz  # PyMuPDF
 import requests
@@ -58,58 +60,156 @@ def download_pdf(url: str, *, timeout: int = 60) -> bytes:
 
 
 def _collect_strikeout_rects(page: fitz.Page) -> list[fitz.Rect]:
-    """Collect rectangles of strikethrough annotations on a page."""
-    rects: list[fitz.Rect] = []
+    """Collect rectangles of strikethrough annotations on a page.
 
-    # Method 1: PDF StrikeOut annotations (type code 12 in PyMuPDF)
+    Handles three strikethrough mechanisms common in charter-party PDFs:
+
+      1. Standard PDF *StrikeOut* annotations  (annotation subtype 12).
+      2. Thin horizontal **lines** drawn through text  (vector-graphic ``l`` items).
+      3. Thin filled / stroked **rectangles** drawn over text  (vector-graphic
+         ``re`` items) — the **dominant** mechanism in many annotated PDFs and
+         previously unhandled.
+    """
+    rects: list[fitz.Rect] = []
+    n_annot = n_line = n_rect = 0
+
+    # --- Method 1: PDF StrikeOut annotations (type code 12) -------------------
     for annot in page.annots() or []:
         if annot.type[0] == 12:  # StrikeOut
+            # Prefer QuadPoints for precise per-line coverage
+            try:
+                vertices = annot.vertices
+                if vertices and len(vertices) >= 4:
+                    # QuadPoints: groups of 4 points, each defining a quadrilateral
+                    for qi in range(0, len(vertices) - 3, 4):
+                        xs = [vertices[qi + j].x for j in range(4)]
+                        ys = [vertices[qi + j].y for j in range(4)]
+                        qr = fitz.Rect(min(xs), min(ys), max(xs), max(ys))
+                        if not qr.is_empty:
+                            rects.append(qr)
+                            n_annot += 1
+                    continue
+            except Exception:
+                pass
+            # Fallback to annotation bounding box
             rects.append(annot.rect)
+            n_annot += 1
 
-    # Method 2: Horizontal lines drawn through text (vector graphics)
+    # --- Methods 2 & 3: vector-graphic lines and thin rectangles --------------
     for drawing in page.get_drawings():
-        for item in drawing.get("items", []):
-            if item[0] != "l":  # not a line
-                continue
-            p1, p2 = fitz.Point(item[1]), fitz.Point(item[2])
-            # Horizontal line: negligible vertical delta, meaningful width
-            if abs(p1.y - p2.y) < 2 and abs(p1.x - p2.x) > 10:
-                rect = fitz.Rect(
-                    min(p1.x, p2.x), p1.y - 4,
-                    max(p1.x, p2.x), p1.y + 4,
-                )
-                rects.append(rect)
+        fill     = drawing.get("fill")          # fill colour (tuple) or None
+        color    = drawing.get("color")         # stroke colour (tuple) or None
+        stroke_w = drawing.get("width", 0)      # stroke width in pt
 
+        for item in drawing.get("items", []):
+            kind = item[0]
+
+            # Method 2 — horizontal lines
+            if kind == "l":
+                p1, p2 = fitz.Point(item[1]), fitz.Point(item[2])
+                if abs(p1.y - p2.y) < 2 and abs(p1.x - p2.x) > 10:
+                    # Pad vertically by half the stroke width (min 1.5 pt)
+                    pad = max(stroke_w / 2, 1.5)
+                    mid_y = (p1.y + p2.y) / 2
+                    rect = fitz.Rect(
+                        min(p1.x, p2.x), mid_y - pad - 1,
+                        max(p1.x, p2.x), mid_y + pad + 1,
+                    )
+                    rects.append(rect)
+                    n_line += 1
+
+            # Method 3 — thin filled / stroked rectangles
+            elif kind == "re":
+                rect = fitz.Rect(item[1])
+                # A strikethrough bar is thin (< 8 pt) and wide (> 10 pt).
+                # It must be filled or stroked to be visible.
+                if (
+                    rect.width > 10
+                    and rect.height < 8
+                    and (fill is not None or color is not None or stroke_w > 0)
+                ):
+                    rects.append(rect)
+                    n_rect += 1
+
+    if rects:
+        logger.debug(
+            "Page strike candidates: %d total (annot=%d, line=%d, rect=%d)",
+            len(rects), n_annot, n_line, n_rect,
+        )
     return rects
 
 
 def _is_struck_through(span_rect: fitz.Rect, strike_rects: list[fitz.Rect]) -> bool:
-    """Return True if *span_rect* overlaps significantly with any strikethrough rect."""
+    """Return True if *span_rect* is overlapped by a strikethrough indicator.
+
+    Two conditions must both be met:
+
+      1. **Horizontal coverage** — the strike rect covers >= 50 % of the span width.
+      2. **Vertical position** — the vertical centre of the strike rect falls
+         within the middle band (15 %–85 %) of the span height.  This filters
+         out underlines (very bottom) and overlines (very top) that could
+         otherwise satisfy condition 1.
+    """
+    span_width  = span_rect.width  or 1
+    span_height = span_rect.height or 1
+
     for sr in strike_rects:
         intersection = span_rect & sr  # intersection
         if intersection.is_empty:
             continue
-        # If the strikethrough line covers most of the span's width
-        span_width = span_rect.width or 1
-        overlap_ratio = intersection.width / span_width
-        if overlap_ratio > 0.65:
+
+        # 1) horizontal coverage
+        if intersection.width / span_width < 0.50:
+            continue
+
+        # 2) vertical position — 0.0 = top (ascent), 1.0 = bottom (descent)
+        sr_v_centre = (sr.y0 + sr.y1) / 2
+        v_ratio = (sr_v_centre - span_rect.y0) / span_height
+        if 0.15 <= v_ratio <= 0.85:
             return True
+
     return False
 
 
 
 # Text Extraction
 
+# Standalone page number on its own line (e.g. "- 15 -" or just "7")
+_PAGE_NUM_RE = re.compile(r'^[\s\-\–\—]*\d{1,3}[\s\-\–\—]*$')
+
+
+def _normalize_line(line: str) -> str:
+    """Collapse multiple spaces and strip isolated bullet characters."""
+    line = re.sub(r'[\u2022\u25CF\u25A0\u25A1\u25E6\u25AA\u25BA\u25B8\u2023\u2043]\s*', '', line)
+    line = re.sub(r' {2,}', ' ', line)
+    return line.strip()
+
 
 def _extract_page_text(page: fitz.Page) -> str:
-    """Extract text from a single page, filtering out struck-through spans."""
+    """Extract text from a single page, filtering struck-through spans.
+
+    Improvements over a naive extraction:
+      - Text blocks are sorted into visual reading order (top-to-bottom, left-to-right).
+      - A blank line is emitted between blocks to preserve paragraph structure.
+      - Each line is normalised (collapsed whitespace, bullet artefacts removed).
+      - Standalone page-number lines are dropped.
+    """
     strike_rects = _collect_strikeout_rects(page)
-    blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
+    raw_blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
+
+    # Keep only text blocks and sort into visual reading order
+    text_blocks = sorted(
+        [b for b in raw_blocks if b.get("type") == 0],
+        key=lambda b: (round(b["bbox"][1], 1), b["bbox"][0]),
+    )
+
     lines_out: list[str] = []
 
-    for block in blocks:
-        if block.get("type") != 0:  # type 0 = text block; skip non-text (images, etc.)
-            continue
+    for block in text_blocks:
+        # Paragraph separator between blocks (avoid double-blanks)
+        if lines_out and lines_out[-1] != "":
+            lines_out.append("")
+
         for line in block["lines"]:
             spans_text: list[str] = []
             for span in line["spans"]:
@@ -119,10 +219,68 @@ def _extract_page_text(page: fitz.Page) -> str:
                     continue
                 spans_text.append(span["text"])
             joined = "".join(spans_text).rstrip()
-            if joined:
-                lines_out.append(joined)
+            normalised = _normalize_line(joined)
+            if not normalised:
+                continue
+            # Drop standalone page numbers
+            if _PAGE_NUM_RE.match(normalised):
+                continue
+            lines_out.append(normalised)
 
     return "\n".join(lines_out)
+
+
+def _remove_headers_footers(
+    pages: list[tuple[int, str]],
+    *,
+    look_lines: int = 2,
+    min_page_ratio: float = 0.5,
+    max_line_len: int = 80,
+) -> list[tuple[int, str]]:
+    """Remove short lines that repeat across many pages (likely headers/footers).
+
+    Only lines shorter than *max_line_len* characters that appear in at least
+    *min_page_ratio* of pages (at the top or bottom *look_lines*) are removed.
+    """
+    if len(pages) < 4:
+        return pages
+
+    threshold = int(len(pages) * min_page_ratio)
+    top_counts: Counter[str] = Counter()
+    bot_counts: Counter[str] = Counter()
+
+    for _, text in pages:
+        non_empty = [l.strip() for l in text.split("\n") if l.strip()]
+        for line in non_empty[:look_lines]:
+            norm = re.sub(r'\s+', ' ', line.lower())
+            if 2 < len(norm) <= max_line_len:
+                top_counts[norm] += 1
+        for line in non_empty[-look_lines:]:
+            norm = re.sub(r'\s+', ' ', line.lower())
+            if 2 < len(norm) <= max_line_len:
+                bot_counts[norm] += 1
+
+    to_remove = {l for l, c in top_counts.items() if c >= threshold}
+    to_remove |= {l for l, c in bot_counts.items() if c >= threshold}
+
+    if to_remove:
+        logger.info("Removing %d detected header/footer patterns", len(to_remove))
+
+    cleaned: list[tuple[int, str]] = []
+    for page_num, text in pages:
+        out_lines = [
+            line for line in text.split("\n")
+            if re.sub(r'\s+', ' ', line.strip().lower()) not in to_remove
+        ]
+        cleaned.append((page_num, "\n".join(out_lines)))
+    return cleaned
+
+
+def _final_normalize(text: str) -> str:
+    """Collapse excessive blank lines and trailing whitespace."""
+    text = re.sub(r'\n{3,}', '\n\n', text)   # max 2 consecutive newlines
+    text = re.sub(r'[ \t]+\n', '\n', text)    # strip line-trailing whitespace
+    return text.strip()
 
 
 def extract_text(
@@ -130,6 +288,11 @@ def extract_text(
     page_range: PageRange = PART_II_PAGES,
 ) -> str:
     """Extract clean text from the given page range, excluding strikethrough text.
+
+    Pipeline:
+      1. Per-page extraction with strike filtering and line normalisation.
+      2. Cross-page header / footer removal.
+      3. Final whitespace normalisation.
 
     Args:
         pdf_bytes: Raw PDF file bytes.
@@ -148,14 +311,27 @@ def extract_text(
             page_range.end, total_pages,
         )
 
-    pages_text: list[str] = []
+    # Step 1 — per-page extraction
+    raw_pages: list[tuple[int, str]] = []
     for page_num in range(page_range.start_0, min(page_range.end_0, total_pages)):
         page = doc[page_num]
         text = _extract_page_text(page)
         if text.strip():
-            pages_text.append(f"--- PAGE {page_num + 1} ---\n{text}")
-
+            raw_pages.append((page_num, text))
     doc.close()
+
+    # Step 2 — header / footer removal
+    cleaned_pages = _remove_headers_footers(raw_pages)
+
+    # Step 3 — assemble with page markers
+    pages_text: list[str] = []
+    for page_num, text in cleaned_pages:
+        pages_text.append(f"--- PAGE {page_num + 1} ---\n{text}")
+
     full_text = "\n\n".join(pages_text)
-    logger.info("Extracted %d characters from %d pages", len(full_text), len(pages_text))
+
+    # Step 4 — final normalisation
+    full_text = _final_normalize(full_text)
+
+    logger.info("Extracted %d characters from %d pages", len(full_text), len(cleaned_pages))
     return full_text

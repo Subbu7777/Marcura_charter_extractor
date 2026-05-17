@@ -10,6 +10,11 @@ class Clause(BaseModel):
     id: str = Field(description="Clause number/identifier (e.g. '1', '2', '3(a)')")
     title: str = Field(description="Clause title or heading")
     text: str = Field(description="Full clause text content, excluding strikethrough text")
+    section: str = Field(
+        default="",
+        exclude=True,
+        description="Document section (internal use for dedup, excluded from output)",
+    )
 
 
 class ExtractionResult(BaseModel):
