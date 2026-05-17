@@ -52,13 +52,14 @@ You MUST identify which section each clause belongs to and tag it in the "sectio
 
 CORE EXTRACTION RULES:
 
-1. Extract every clause that starts with:
+1. Extract EVERY clause that starts with:
    <number>. <title>
    A clause is defined by its number + title and all following content until the next
    clause or section heading begins.
+   NEVER SKIP a clause — even if it seems incomplete, redundant, or struck through.
 
 2. For each clause return:
-   - "id":      clause number as a string
+   - "id":      clause number as a string (e.g., "1", "2", "3")
    - "title":   clause heading / title
    - "text":    FULL clause content (verbatim)
    - "section": one of "Part II", "Additional Clauses", or "Rider Clauses"
@@ -74,6 +75,8 @@ CORE EXTRACTION RULES:
    - The SAME clause number may appear in DIFFERENT sections — these are DIFFERENT clauses.
      Always include ALL of them with the correct section tag.
    - NEVER merge clauses from different sections.
+   - If a section has clauses 1, 2, 4, 5 (missing 3), still extract 1, 2, 4, 5 — do NOT
+     renumber them or fill in gaps.
 
 5. WITHIN EACH SECTION, each clause ID should appear ONLY ONCE.
    - The struck-through text has already been removed from the input.
@@ -83,7 +86,13 @@ CORE EXTRACTION RULES:
    - If two different sub-sections genuinely share an id but have completely
      unrelated titles and content, include both.
 
-6. DO NOT:
+6. COMPLETENESS CHECK:
+   - Verify you have extracted every numbered clause present in the text.
+   - If clause numbers skip (e.g., 1, 2, 4 — missing 3), that's okay as long as
+     you faithfully reflect what's in the document.
+   - NEVER skip a clause that exists in the source text.
+
+7. DO NOT:
    - Summarize or rewrite text
    - Merge clauses from different sections
    - Invent missing content
@@ -91,19 +100,19 @@ CORE EXTRACTION RULES:
    - Alter wording
    - Include any text that was crossed out / struck through
 
-7. CLEAN ONLY:
+8. CLEAN ONLY:
    Ignore page numbers, headers/footers, watermarks, OCR noise.
 
-8. PRESERVE:
+9. PRESERVE:
    - Original order of appearance within each section
    - Exact wording and formatting
    - Full legal structure
 
-9. Clause boundary rule:
+10. Clause boundary rule:
    A clause ends ONLY when a new line starting with <number>. <title> appears,
    a new section heading appears, or the document ends.
 
-10. OUTPUT FORMAT — return ONLY valid JSON:
+11. OUTPUT FORMAT — return ONLY valid JSON:
 
 {
   "clauses": [
@@ -255,31 +264,51 @@ def _call_gemini(
 
 def _parse_clauses(raw_content: str) -> list[Clause]:
     """Parse raw JSON response into a list of Clause objects."""
+    clauses: list[Clause] = []
+    
     try:
         result = ExtractionResult.model_validate_json(raw_content)
-        return result.clauses
+        clauses = result.clauses
     except Exception:
         pass
 
-    # Fallback: manual JSON parsing
-    try:
-        data = json.loads(raw_content)
-        if "clauses" in data:
-            return [Clause.model_validate(c) for c in data["clauses"]]
-    except Exception:
-        pass
+    if not clauses:
+        # Fallback: manual JSON parsing
+        try:
+            data = json.loads(raw_content)
+            if "clauses" in data:
+                clauses = [Clause.model_validate(c) for c in data["clauses"]]
+        except Exception:
+            pass
 
-    # Last resort: try to find JSON in the response
-    try:
-        start = raw_content.index("{")
-        end = raw_content.rindex("}") + 1
-        data = json.loads(raw_content[start:end])
-        if "clauses" in data:
-            return [Clause.model_validate(c) for c in data["clauses"]]
-    except (ValueError, json.JSONDecodeError):
-        pass
+    if not clauses:
+        # Last resort: try to find JSON in the response
+        try:
+            start = raw_content.index("{")
+            end = raw_content.rindex("}") + 1
+            data = json.loads(raw_content[start:end])
+            if "clauses" in data:
+                clauses = [Clause.model_validate(c) for c in data["clauses"]]
+        except (ValueError, json.JSONDecodeError):
+            pass
 
-    raise ValueError(f"Could not parse LLM response as clause JSON: {raw_content[:200]}...")
+    if not clauses:
+        raise ValueError(f"Could not parse LLM response as clause JSON: {raw_content[:200]}...")
+
+    # Log all extracted clauses for debugging missing clauses
+    logger.info("LLM returned %d clauses:", len(clauses))
+    for c in clauses:
+        logger.debug("  -> id=%s section='%s' title='%s'", c.id, c.section, c.title[:40] if c.title else "")
+    
+    # Log clause IDs by section to catch gaps
+    from collections import defaultdict
+    by_section: dict[str, list[str]] = defaultdict(list)
+    for c in clauses:
+        by_section[c.section or "Unknown"].append(c.id or "?")
+    for sec, ids in sorted(by_section.items()):
+        logger.info("  Section '%s': IDs = %s", sec, ", ".join(ids))
+
+    return clauses
 
 
 def _deduplicate_clauses(clauses: list[Clause]) -> list[Clause]:
@@ -332,14 +361,17 @@ def _deduplicate_clauses(clauses: list[Clause]) -> list[Clause]:
 
             # Exact duplicate — skip
             if norm_new == norm_existing:
+                logger.debug("Dedup: skipping exact duplicate id=%s section='%s'", clause.id, clause.section)
                 continue
 
             # New text already contained in existing — skip
             if norm_new in norm_existing:
+                logger.debug("Dedup: skipping subset id=%s section='%s' (new text in existing)", clause.id, clause.section)
                 continue
 
             # Existing text is a subset of new — keep the longer one
             if norm_existing in norm_new:
+                logger.debug("Dedup: replacing with longer version id=%s section='%s'", clause.id, clause.section)
                 seen_by_key[key] = clause
                 for i, e in enumerate(result):
                     if e is existing:
@@ -358,13 +390,14 @@ def _deduplicate_clauses(clauses: list[Clause]) -> list[Clause]:
                             result[i] = clause
                             break
                 logger.info(
-                    "Dedup: clause %s '%s' — kept replacement (%d chars over %d)",
-                    clause.id, clause.title[:30],
+                    "Dedup: clause %s section='%s' — kept replacement (%d chars over %d)",
+                    clause.id, clause.section,
                     len(winner.text), len((clause if winner is existing else existing).text),
                 )
                 continue
 
             # Otherwise concatenate (likely a chunk-boundary continuation)
+            logger.debug("Dedup: merging chunk continuation id=%s section='%s'", clause.id, clause.section)
             merged_text = existing.text.rstrip() + "\n" + clause.text.lstrip()
             merged = Clause(
                 id=existing.id,
@@ -381,7 +414,84 @@ def _deduplicate_clauses(clauses: list[Clause]) -> list[Clause]:
             seen_by_key[key] = clause
             result.append(clause)
 
+    # Log final dedup result by section
+    logger.info("After dedup: %d clauses", len(result))
+    from collections import defaultdict
+    by_section: dict[str, list[str]] = defaultdict(list)
+    for c in result:
+        by_section[c.section or "Unknown"].append(c.id or "?")
+    for sec, ids in sorted(by_section.items()):
+        logger.info("  Dedup result - Section '%s': IDs = %s", sec, ", ".join(ids))
+
     return result
+
+
+# ---------------------------------------------------------------------------
+# Text Cleaning for Client-Ready Output
+# ---------------------------------------------------------------------------
+
+def _clean_text_for_output(text: str) -> str:
+    """Clean and normalize text for client-ready JSON output.
+
+    Transformations:
+      1. Fix encoding artefacts (bullets, special chars).
+      2. Normalize paragraph breaks: preserve `\\n\\n` as single line break.
+      3. Convert soft line wraps (single `\\n`) to spaces.
+      4. Collapse multiple spaces.
+      5. Strip leading/trailing whitespace.
+    """
+    if not text:
+        return ""
+
+    # Fix common encoding artefacts (replacement char from bad encoding)
+    text = text.replace('\ufffd', '')  # replacement character
+    text = re.sub(r'[�]', '', text)    # literal question-mark-diamond
+    
+    # Normalize various dash types to standard hyphen
+    text = re.sub(r'[\u2013\u2014\u2015]', '-', text)
+    
+    # Preserve paragraph breaks: mark them temporarily
+    text = re.sub(r'\n{2,}', '\n<PARA>\n', text)
+    
+    # Convert soft line breaks to spaces (preserving indentation markers)
+    # Keep sub-clause markers like (a), (b), (i), (ii) on separate lines
+    lines = text.split('\n')
+    cleaned_lines: list[str] = []
+    
+    for line in lines:
+        stripped = line.strip()
+        if stripped == '<PARA>':
+            cleaned_lines.append('<PARA>')
+        elif not stripped:
+            continue
+        else:
+            # Check if line starts with a sub-clause marker
+            is_subclause = bool(re.match(
+                r'^(\([a-z]\)|\([ivx]+\)|\([0-9]+\)|[a-z]\)|[ivx]+\)|[0-9]+\)|\([A-Z]\))',
+                stripped
+            ))
+            if is_subclause and cleaned_lines and cleaned_lines[-1] != '<PARA>':
+                # Keep sub-clause on new line but mark it
+                cleaned_lines.append('<NEWLINE>' + stripped)
+            else:
+                cleaned_lines.append(stripped)
+    
+    # Join with spaces, then convert markers back
+    text = ' '.join(cleaned_lines)
+    
+    # Convert markers: <PARA> → single space (paragraph flow), <NEWLINE> → space
+    # For cleaner JSON, we'll use space for everything (readable single line per clause)
+    text = re.sub(r'\s*<PARA>\s*', ' ', text)
+    text = re.sub(r'<NEWLINE>', ' ', text)
+    
+    # Collapse multiple spaces
+    text = re.sub(r' {2,}', ' ', text)
+    
+    # Clean up weird punctuation patterns
+    text = re.sub(r'\s+([.,;:])', r'\1', text)  # no space before punctuation
+    text = re.sub(r'([.,;:])\s{2,}', r'\1 ', text)  # single space after punctuation
+    
+    return text.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -437,7 +547,38 @@ def _validate_extraction(clauses: list[Clause]) -> list[Clause]:
         clauses = [c for i, c in enumerate(clauses) if i not in indices_to_drop]
         logger.info("Validation removed %d suspicious entries", len(indices_to_drop))
 
-    return clauses
+    # --- Check for numbering gaps (informational) -----------------------------
+    from collections import defaultdict
+    by_section: dict[str, list[int]] = defaultdict(list)
+    for c in clauses:
+        try:
+            by_section[c.section or "Unknown"].append(int(c.id))
+        except (ValueError, TypeError):
+            pass  # non-numeric ID
+    
+    for sec, ids in by_section.items():
+        if not ids:
+            continue
+        ids_sorted = sorted(ids)
+        expected = set(range(1, max(ids_sorted) + 1))
+        missing = expected - set(ids_sorted)
+        if missing:
+            logger.warning(
+                "Section '%s' has gaps in numbering: missing IDs %s (found: %s)",
+                sec, sorted(missing), ids_sorted,
+            )
+
+    # --- Clean text for client-ready output -----------------------------------
+    cleaned_clauses: list[Clause] = []
+    for c in clauses:
+        cleaned_clauses.append(Clause(
+            id=c.id,
+            title=(c.title or "").strip(),
+            text=_clean_text_for_output(c.text),
+            section=c.section,
+        ))
+
+    return cleaned_clauses
 
 
 # ---------------------------------------------------------------------------

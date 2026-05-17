@@ -99,7 +99,7 @@ def _collect_strikeout_rects(page: fitz.Page) -> list[fitz.Rect]:
     for drawing in page.get_drawings():
         fill     = drawing.get("fill")          # fill colour (tuple) or None
         color    = drawing.get("color")         # stroke colour (tuple) or None
-        stroke_w = drawing.get("width", 0)      # stroke width in pt
+        stroke_w = drawing.get("width", 0)  or 0.0     # stroke width in pt
 
         for item in drawing.get("items", []):
             kind = item[0]
@@ -179,9 +179,15 @@ _PAGE_NUM_RE = re.compile(r'^[\s\-\–\—]*\d{1,3}[\s\-\–\—]*$')
 
 
 def _normalize_line(line: str) -> str:
-    """Collapse multiple spaces and strip isolated bullet characters."""
-    line = re.sub(r'[\u2022\u25CF\u25A0\u25A1\u25E6\u25AA\u25BA\u25B8\u2023\u2043]\s*', '', line)
-    line = re.sub(r' {2,}', ' ', line)
+    """Collapse multiple spaces, strip isolated bullet characters, and fix encoding artefacts."""
+    # Remove various bullet characters
+    line = re.sub(r'[\u2022\u25CF\u25A0\u25A1\u25E6\u25AA\u25BA\u25B8\u2023\u2043\u25CB\u25D8\u25D9]\s*', '', line)
+    # Remove replacement characters (encoding failures)
+    line = re.sub(r'[\ufffd�]', '', line)
+    # Normalize various dash types
+    line = re.sub(r'[\u2013\u2014\u2015]', '-', line)
+    # Fix common OCR artefacts
+    line = re.sub(r'[^\S\n]+', ' ', line)  # collapse all whitespace except newlines to single space
     return line.strip()
 
 
